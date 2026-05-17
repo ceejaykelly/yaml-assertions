@@ -4,8 +4,12 @@
 package assert
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -21,6 +25,9 @@ const (
 	Contains Operator = "contains"
 	All      Operator = "all"
 	Exists   Operator = "exists"
+	// Script runs a shell command and treats a zero exit code as pass.
+	// The queried value is provided to the command as the VALUE environment variable.
+	Script Operator = "script"
 
 	// Future operators to implement:
 	// GreaterThan        Operator = ">"
@@ -40,8 +47,11 @@ type AssertSpec struct {
 	// Name filters documents by metadata.name. Leave empty to match any name.
 	Name string `yaml:"name,omitempty" json:"name,omitempty"`
 
-	// Path is a dot-and-bracket-notation path into the YAML document,
-	// e.g. "spec.template.spec.containers[0].image".
+	// Path is a dot-and-bracket-notation path into the YAML document.
+	// Supports numeric indexing and field-value filter expressions:
+	//
+	//   "spec.template.spec.containers[0].image"         — numeric index
+	//   "spec.template.spec.containers[name=app].image"  — filter by field value
 	Path string `yaml:"path" json:"path"`
 
 	// Op is the comparison operator (==, !=, contains, exists).
@@ -50,7 +60,26 @@ type AssertSpec struct {
 	Op Operator `yaml:"operator" json:"operator"`
 
 	// Value is the expected value for the assertion. Ignored when Op is "exists".
+	// For Op "script", Value must be a shell command string.
 	Value any `yaml:"expected,omitempty" json:"expected,omitempty"`
+}
+
+// segmentType describes the kind of a single parsed path component.
+type segmentType uint8
+
+const (
+	segmentKey    segmentType = iota // "foo" — map key
+	segmentIndex                     // "[0]" — numeric array index
+	segmentFilter                    // "[name=app]" — filter array element by field value
+)
+
+// pathSegment is a single component of a parsed YAML path expression.
+type pathSegment struct {
+	typ         segmentType
+	key         string // segmentKey: the map key name
+	index       int    // segmentIndex: the array index
+	filterKey   string // segmentFilter: field name to match
+	filterValue string // segmentFilter: expected field value
 }
 
 // normalizeNumber converts common numeric types to float64 to allow
@@ -75,14 +104,13 @@ func normalizeNumber(v any) (float64, bool) {
 	}
 }
 
-// parsePath splits a dot-and-bracket-notation path into individual keys.
-// Examples:
+// parsePath splits a path expression into typed segments. Supports:
 //
-//	"foo.bar"        → ["foo", "bar"]
-//	"foo[0].bar"     → ["foo", "0", "bar"]
-//	"foo.bar[2].baz" → ["foo", "bar", "2", "baz"]
-func parsePath(path string) []string {
-	var result []string
+//	"foo.bar"             → [key:foo, key:bar]
+//	"foo[0].bar"          → [key:foo, index:0, key:bar]
+//	"foo[name=bar].baz"   → [key:foo, filter:{name=bar}, key:baz]
+func parsePath(path string) []pathSegment {
+	var result []pathSegment
 	i := 0
 	for i < len(path) {
 		if path[i] == '.' {
@@ -90,13 +118,27 @@ func parsePath(path string) []string {
 			continue
 		}
 		if path[i] == '[' {
-			// Bracket index: extract digits between [ and ]
+			// Bracket segment: extract content between [ and ]
 			j := i + 1
 			for j < len(path) && path[j] != ']' {
 				j++
 			}
 			if j < len(path) && path[j] == ']' {
-				result = append(result, path[i+1:j])
+				content := path[i+1 : j]
+				if eqIdx := strings.Index(content, "="); eqIdx >= 0 {
+					// Filter segment: [key=value]
+					result = append(result, pathSegment{
+						typ:         segmentFilter,
+						filterKey:   content[:eqIdx],
+						filterValue: content[eqIdx+1:],
+					})
+				} else if idx, err := strconv.Atoi(content); err == nil {
+					// Numeric index segment: [0]
+					result = append(result, pathSegment{typ: segmentIndex, index: idx})
+				} else {
+					// Unrecognised bracket content — treat as a map key
+					result = append(result, pathSegment{typ: segmentKey, key: content})
+				}
 				i = j + 1
 				continue
 			}
@@ -106,63 +148,96 @@ func parsePath(path string) []string {
 		for j < len(path) && path[j] != '.' && path[j] != '[' {
 			j++
 		}
-		result = append(result, path[i:j])
+		if j > i {
+			result = append(result, pathSegment{typ: segmentKey, key: path[i:j]})
+		}
 		i = j
 	}
 	return result
 }
 
-// Evaluate walks the given YAML byte slice along object_path and compares the
+// resolvePath walks segments over data and returns (value, found, error).
+// found=false with nil error means the path simply does not exist.
+// A non-nil error indicates an irrecoverable problem (e.g. out-of-range index).
+func resolvePath(data map[string]interface{}, segments []pathSegment) (any, bool, error) {
+	var current any = data
+	for _, seg := range segments {
+		switch seg.typ {
+		case segmentKey:
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				// Type mismatch during traversal — treat as not found
+				return nil, false, nil
+			}
+			val, exists := m[seg.key]
+			if !exists {
+				return nil, false, nil
+			}
+			current = val
+
+		case segmentIndex:
+			arr, ok := current.([]interface{})
+			if !ok {
+				return nil, false, nil
+			}
+			if seg.index < 0 || seg.index >= len(arr) {
+				return nil, false, fmt.Errorf("array index %d out of range (length %d)", seg.index, len(arr))
+			}
+			current = arr[seg.index]
+
+		case segmentFilter:
+			arr, ok := current.([]interface{})
+			if !ok {
+				return nil, false, nil
+			}
+			matched := false
+			for _, item := range arr {
+				itemMap, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				val, exists := itemMap[seg.filterKey]
+				if !exists {
+					continue
+				}
+				// Compare as string to handle YAML numeric values transparently
+				if fmt.Sprintf("%v", val) == seg.filterValue {
+					current = item
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil, false, nil
+			}
+		}
+	}
+	return current, true, nil
+}
+
+// Evaluate walks the given YAML byte slice along objectPath and compares the
 // found value using the specified operator. It returns (true, nil) when the
 // assertion passes, (false, nil) when it fails cleanly, and (false, err) when
 // the path or values cannot be resolved.
-func Evaluate(values []byte, object_path string, operator string, expected any) (bool, error) {
+func Evaluate(values []byte, objectPath string, operator string, expected any) (bool, error) {
 	var data map[string]interface{}
 	if err := yaml.Unmarshal(values, &data); err != nil {
 		return false, fmt.Errorf("failed to unmarshal values: %w", err)
 	}
 
-	parts := parsePath(object_path)
-	var current any = data
-	for i, part := range parts {
-		// Try array index
-		if idx, err := strconv.Atoi(part); err == nil {
-			arr, ok := current.([]interface{})
-			if !ok {
-				if operator == "exists" {
-					return false, nil
-				}
-				return false, fmt.Errorf("expected array at %s", part)
-			}
-			if idx < 0 || idx >= len(arr) {
-				if operator == "exists" {
-					return false, nil
-				}
-				return false, fmt.Errorf("invalid array index: %s", part)
-			}
-			current = arr[idx]
-			continue
+	segments := parsePath(objectPath)
+	current, found, err := resolvePath(data, segments)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		if operator == string(Exists) {
+			return false, nil
 		}
-		// Otherwise, treat as map key
-		m, ok := current.(map[string]interface{})
-		if !ok {
-			if operator == "exists" {
-				return false, nil
-			}
-			return false, fmt.Errorf("expected map at %s", part)
-		}
-		var exists bool
-		current, exists = m[part]
-		if !exists {
-			if operator == "exists" {
-				return false, nil
-			}
-			return false, fmt.Errorf("path not found: %s", part)
-		}
-		// If this is the last part and operator is exists, return true
-		if operator == "exists" && i == len(parts)-1 {
-			return true, nil
-		}
+		return false, fmt.Errorf("path not found: %s", objectPath)
+	}
+	if operator == string(Exists) {
+		return true, nil
 	}
 
 	// Normalize numbers for comparison
@@ -174,15 +249,14 @@ func Evaluate(values []byte, object_path string, operator string, expected any) 
 	}
 
 	// Compare using the operator
-	switch operator {
-	case "==":
+	switch Operator(operator) {
+	case Equal:
 		return reflect.DeepEqual(current, expected), nil
-	case "!=":
+	case NotEqual:
 		return !reflect.DeepEqual(current, expected), nil
-	case "exists":
-		// If we got here, the path exists
+	case Exists:
 		return true, nil
-	case "contains":
+	case Contains:
 		// Support string contains and array contains
 		switch v := current.(type) {
 		case string:
@@ -190,7 +264,7 @@ func Evaluate(values []byte, object_path string, operator string, expected any) 
 			if !ok {
 				return false, fmt.Errorf("expected value for contains must be a string when target is string")
 			}
-			return containsString(v, substr), nil
+			return strings.Contains(v, substr), nil
 		case []interface{}:
 			normalizedExpected, err := normalizeViaYAML(expected)
 			if err != nil {
@@ -215,7 +289,7 @@ func Evaluate(values []byte, object_path string, operator string, expected any) 
 		default:
 			return false, fmt.Errorf("contains operator not supported for type %T", current)
 		}
-	case "all":
+	case All:
 		// For arrays: require every element to match the expected value/subset
 		switch v := current.(type) {
 		case []interface{}:
@@ -242,15 +316,64 @@ func Evaluate(values []byte, object_path string, operator string, expected any) 
 		default:
 			return false, fmt.Errorf("all operator not supported for type %T", current)
 		}
+	case Script:
+		scriptStr, ok := expected.(string)
+		if !ok {
+			return false, fmt.Errorf("script operator requires expected to be a shell command string")
+		}
+		return runScript(scriptStr, current)
 	default:
 		return false, fmt.Errorf("unsupported operator: %s", operator)
 	}
 }
 
-// containsString reports whether substr is contained in s.
-// It delegates directly to strings.Contains, which uses an efficient algorithm.
-func containsString(s, substr string) bool {
-	return strings.Contains(s, substr)
+// EvaluateFunc resolves objectPath within values and passes the found value to
+// fn for custom validation. fn receives nil when the path does not exist.
+// This is the idiomatic way to run arbitrary Go logic against a queried value
+// in programmatic tests.
+//
+// Example:
+//
+//	pass, err := assert.EvaluateFunc(docBytes, "spec.replicas", func(v any) (bool, error) {
+//	    n, ok := v.(float64)
+//	    return ok && n >= 2, nil
+//	})
+func EvaluateFunc(values []byte, objectPath string, fn func(value any) (bool, error)) (bool, error) {
+	var data map[string]interface{}
+	if err := yaml.Unmarshal(values, &data); err != nil {
+		return false, fmt.Errorf("failed to unmarshal values: %w", err)
+	}
+
+	segments := parsePath(objectPath)
+	value, _, err := resolvePath(data, segments)
+	if err != nil {
+		return false, err
+	}
+	return fn(value)
+}
+
+// runScript runs script as a shell command with value exposed as the VALUE
+// environment variable. Exit code 0 → pass (true, nil); non-zero → fail
+// (false, nil); execution failure → (false, err).
+//
+// On Windows cmd /C is used; on all other platforms sh -c is used.
+func runScript(script string, value any) (bool, error) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", script)
+	} else {
+		cmd = exec.Command("sh", "-c", script)
+	}
+	cmd.Env = append(os.Environ(), "VALUE="+fmt.Sprintf("%v", value))
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			// Non-zero exit code means assertion failure, not an execution error
+			return false, nil
+		}
+		return false, fmt.Errorf("script execution error: %w", err)
+	}
+	return true, nil
 }
 
 // normalizeViaYAML converts v to the same type representation that YAML

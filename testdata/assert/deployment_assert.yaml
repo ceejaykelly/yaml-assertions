@@ -40,3 +40,28 @@ all-containers-run-as-non-root:
   expected:
     securityContext:
       runAsNonRoot: true
+
+# Filter-based assertions: target a specific container by name rather than index.
+# This is robust when the container order may vary or additional containers are added.
+check-sidecar-has-unique-env-var:
+  kind: Deployment
+  name: test-value-override
+  path: spec.template.spec.containers[name=sidecar].env
+  operator: contains
+  expected:
+    name: SIDECAR_ONLY_VAR
+
+check-sidecar-does-not-have-main-env:
+  kind: Deployment
+  name: test-value-override
+  path: spec.template.spec.containers[name=sidecar].env
+  operator: contains
+  expected:
+    name: SIDECAR_PORT
+
+check-main-container-image-by-name:
+  kind: Deployment
+  name: test-value-override
+  path: spec.template.spec.containers[name=test-value-override].image
+  operator: contains
+  expected: test-repo

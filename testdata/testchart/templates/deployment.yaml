@@ -33,3 +33,12 @@ spec:
               value: "value"
           securityContext:
             runAsNonRoot: true
+        - name: sidecar
+          image: "busybox:latest"
+          env:
+            - name: SIDECAR_ONLY_VAR
+              value: "sidecar-value"
+            - name: SIDECAR_PORT
+              value: "9090"
+          securityContext:
+            runAsNonRoot: true
