@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/ceejaykelly/yaml-assertions/compare/v0.1.2...v0.2.0) (2026-05-17)
+
+
+### Features
+
+* adding a little more advanced querying layer ([b963cbe](https://github.com/ceejaykelly/yaml-assertions/commit/b963cbe80f4a6dd0d5a81accde71c2f596fa21ae))
+
 ## [0.1.2](https://github.com/ceejaykelly/yaml-assertions/compare/v0.1.1...v0.1.2) (2026-05-10)
 
 
